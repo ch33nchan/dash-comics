@@ -201,7 +201,6 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7777)
-    parser.add_argument("--share", action="store_true")
     args = parser.parse_args()
 
     reader = ComicReader(
@@ -212,7 +211,7 @@ def main():
     )
     
     app = build_ui(reader)
-    app.launch(server_name=args.host, server_port=args.port, share=args.share)
+    app.launch(server_name=args.host, server_port=args.port, share=True)
 
 
 if __name__ == "__main__":
