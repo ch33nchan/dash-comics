@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
+import fitz
 import gradio as gr
 import numpy as np
 import rarfile
@@ -37,13 +38,25 @@ class ComicReader:
         if not self.comics_dir.exists():
             self.comics_dir.mkdir(parents=True, exist_ok=True)
             return []
-        return [f.name for f in self.comics_dir.glob("*.cbr")]
+        cbr_files = list(self.comics_dir.glob("*.cbr"))
+        pdf_files = list(self.comics_dir.glob("*.pdf"))
+        return sorted([f.name for f in cbr_files + pdf_files])
 
-    def load_cbr(self, filename: str) -> list[Image.Image]:
+    def load_comic(self, filename: str) -> list[Image.Image]:
         if not filename:
             return []
         self.pages = []
-        cbr_path = self.comics_dir / filename
+        filepath = self.comics_dir / filename
+        
+        if filename.lower().endswith(".cbr"):
+            self._load_cbr(filepath)
+        elif filename.lower().endswith(".pdf"):
+            self._load_pdf(filepath)
+        
+        self.current_page_idx = 0
+        return self.pages
+
+    def _load_cbr(self, cbr_path: Path) -> None:
         with rarfile.RarFile(cbr_path) as rf:
             image_files = sorted([
                 f for f in rf.namelist()
@@ -53,8 +66,16 @@ class ComicReader:
                 data = rf.read(img_file)
                 img = Image.open(io.BytesIO(data)).convert("RGB")
                 self.pages.append(img)
-        self.current_page_idx = 0
-        return self.pages
+
+    def _load_pdf(self, pdf_path: Path, dpi: int = 150) -> None:
+        doc = fitz.open(pdf_path)
+        zoom = dpi / 72
+        matrix = fitz.Matrix(zoom, zoom)
+        for page in doc:
+            pix = page.get_pixmap(matrix=matrix)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            self.pages.append(img)
+        doc.close()
 
     def analyze_region(self, image: Image.Image, x: int, y: int, w: int, h: int) -> str:
         region = image.crop((x, y, x + w, y + h))
@@ -130,7 +151,7 @@ class ComicReader:
 
 def build_ui(reader: ComicReader) -> gr.Blocks:
     with gr.Blocks(title="AI Comic Reader") as app:
-        gr.Markdown("# AI Comic Reader\nSelect a comic, click on panels to hear them come alive.")
+        gr.Markdown("# AI Comic Reader\nSelect a comic (CBR/PDF), click on panels to hear them come alive.")
         
         with gr.Row():
             comic_dropdown = gr.Dropdown(
@@ -154,7 +175,7 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
         def load_comic(filename):
             if not filename:
                 return None, gr.update(maximum=0, value=0)
-            reader.load_cbr(filename)
+            reader.load_comic(filename)
             max_page = len(reader.pages) - 1
             return np.array(reader.pages[0]), gr.update(maximum=max_page, value=0)
 
