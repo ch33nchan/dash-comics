@@ -171,7 +171,7 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
             page_slider = gr.Slider(0, 0, step=1, label="Page", interactive=True)
         
         with gr.Row():
-            comic_image = gr.Image(label="Comic Page", interactive=True)
+            comic_image = gr.Image(label="Comic Page", interactive=False)
         
         with gr.Row():
             description_output = gr.Textbox(label="Scene Description")
