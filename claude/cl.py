@@ -116,11 +116,14 @@ class ComicReader:
     def generate_sound(self, description: str, duration: float = 2.0) -> tuple[int, np.ndarray]:
         prompt = f"comic book sound effect: {description}"
         
+        generator = torch.Generator(device=self.device).manual_seed(np.random.randint(0, 2**32))
+        
         with torch.no_grad():
             audio = self.audio_pipe(
                 prompt,
                 num_inference_steps=20,
-                audio_length_in_s=duration
+                audio_length_in_s=duration,
+                generator=generator
             ).audios[0]
         
         sample_rate = 16000
@@ -135,18 +138,21 @@ class ComicReader:
         if image is None or len(self.pages) == 0:
             return "No image loaded", (16000, np.zeros(16000, dtype=np.int16))
         
-        x, y = evt.index
-        h, w = image.shape[:2]
-        region_size = min(w, h) // 3
-        
-        x1 = max(0, x - region_size // 2)
-        y1 = max(0, y - region_size // 2)
-        
+        click_x, click_y = evt.index
         pil_image = self.pages[self.current_page_idx]
-        description = self.analyze_region(pil_image, x1, y1, region_size, region_size)
+        img_w, img_h = pil_image.size
+        
+        region_size = min(img_w, img_h) // 4
+        
+        x1 = max(0, click_x - region_size // 2)
+        y1 = max(0, click_y - region_size // 2)
+        x2 = min(img_w, x1 + region_size)
+        y2 = min(img_h, y1 + region_size)
+        
+        description = self.analyze_region(pil_image, x1, y1, x2 - x1, y2 - y1)
         audio = self.generate_sound(description)
         
-        return description, audio
+        return f"[{x1},{y1} -> {x2},{y2}] {description}", audio
 
 
 def build_ui(reader: ComicReader) -> gr.Blocks:
@@ -161,6 +167,7 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
             )
             load_btn = gr.Button("Load")
             refresh_btn = gr.Button("Refresh")
+            reset_btn = gr.Button("Reset")
             page_slider = gr.Slider(0, 0, step=1, label="Page", interactive=True)
         
         with gr.Row():
@@ -188,11 +195,23 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
             reader.current_page_idx = int(page_num)
             return np.array(reader.pages[reader.current_page_idx])
 
+        def reset_all():
+            reader.pages = []
+            reader.current_page_idx = 0
+            return (
+                gr.update(value=None),
+                gr.update(maximum=0, value=0),
+                "",
+                None,
+                gr.update(value=None)
+            )
+
         refresh_btn.click(refresh_list, outputs=[comic_dropdown])
         load_btn.click(load_comic, inputs=[comic_dropdown], outputs=[comic_image, page_slider])
         comic_dropdown.change(load_comic, inputs=[comic_dropdown], outputs=[comic_image, page_slider])
         page_slider.change(change_page, inputs=[page_slider], outputs=[comic_image])
         comic_image.select(reader.process_click, inputs=[comic_image], outputs=[description_output, audio_output])
+        reset_btn.click(reset_all, outputs=[comic_dropdown, page_slider, description_output, audio_output, comic_image])
 
     return app
 
