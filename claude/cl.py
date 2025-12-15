@@ -1,7 +1,6 @@
 import argparse
 import io
 import os
-import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -10,15 +9,15 @@ import numpy as np
 import rarfile
 import torch
 from PIL import Image
-from diffusers import AudioLDM2Pipeline
+from diffusers import AudioLDMPipeline
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
-import scipy.io.wavfile as wavfile
 
 
 class ComicReader:
-    def __init__(self, vlm_model: str, audio_model: str, device: str = "cuda"):
+    def __init__(self, vlm_model: str, audio_model: str, comics_dir: str, device: str = "cuda"):
         self.device = device
+        self.comics_dir = Path(comics_dir)
         self.pages: list[Image.Image] = []
         self.current_page_idx: int = 0
         
@@ -29,13 +28,22 @@ class ComicReader:
         )
         self.vlm_processor = AutoProcessor.from_pretrained(vlm_model)
         
-        self.audio_pipe = AudioLDM2Pipeline.from_pretrained(
+        self.audio_pipe = AudioLDMPipeline.from_pretrained(
             audio_model,
             torch_dtype=torch.float16
         ).to(device)
 
-    def load_cbr(self, cbr_path: str) -> list[Image.Image]:
+    def list_comics(self) -> list[str]:
+        if not self.comics_dir.exists():
+            self.comics_dir.mkdir(parents=True, exist_ok=True)
+            return []
+        return [f.name for f in self.comics_dir.glob("*.cbr")]
+
+    def load_cbr(self, filename: str) -> list[Image.Image]:
+        if not filename:
+            return []
         self.pages = []
+        cbr_path = self.comics_dir / filename
         with rarfile.RarFile(cbr_path) as rf:
             image_files = sorted([
                 f for f in rf.namelist()
@@ -84,13 +92,13 @@ class ComicReader:
         )[0]
         return description
 
-    def generate_sound(self, description: str, duration: float = 3.0) -> tuple[int, np.ndarray]:
+    def generate_sound(self, description: str, duration: float = 2.0) -> tuple[int, np.ndarray]:
         prompt = f"comic book sound effect: {description}"
         
         with torch.no_grad():
             audio = self.audio_pipe(
                 prompt,
-                num_inference_steps=50,
+                num_inference_steps=20,
                 audio_length_in_s=duration
             ).audios[0]
         
@@ -122,10 +130,15 @@ class ComicReader:
 
 def build_ui(reader: ComicReader) -> gr.Blocks:
     with gr.Blocks(title="AI Comic Reader") as app:
-        gr.Markdown("# AI Comic Reader\nLoad a CBR file, click on panels to hear them come alive.")
+        gr.Markdown("# AI Comic Reader\nSelect a comic, click on panels to hear them come alive.")
         
         with gr.Row():
-            cbr_input = gr.File(label="Upload CBR", file_types=[".cbr"])
+            comic_dropdown = gr.Dropdown(
+                choices=reader.list_comics(),
+                label="Select Comic",
+                interactive=True
+            )
+            refresh_btn = gr.Button("Refresh")
             page_slider = gr.Slider(0, 0, step=1, label="Page", interactive=True)
         
         with gr.Row():
@@ -135,18 +148,24 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
             description_output = gr.Textbox(label="Scene Description")
             audio_output = gr.Audio(label="Sound Effect")
 
-        def load_comic(file):
-            if file is None:
+        def refresh_list():
+            return gr.update(choices=reader.list_comics())
+
+        def load_comic(filename):
+            if not filename:
                 return None, gr.update(maximum=0, value=0)
-            reader.load_cbr(file.name)
+            reader.load_cbr(filename)
             max_page = len(reader.pages) - 1
             return np.array(reader.pages[0]), gr.update(maximum=max_page, value=0)
 
         def change_page(page_num):
+            if len(reader.pages) == 0:
+                return None
             reader.current_page_idx = int(page_num)
             return np.array(reader.pages[reader.current_page_idx])
 
-        cbr_input.change(load_comic, inputs=[cbr_input], outputs=[comic_image, page_slider])
+        refresh_btn.click(refresh_list, outputs=[comic_dropdown])
+        comic_dropdown.change(load_comic, inputs=[comic_dropdown], outputs=[comic_image, page_slider])
         page_slider.change(change_page, inputs=[page_slider], outputs=[comic_image])
         comic_image.select(reader.process_click, inputs=[comic_image], outputs=[description_output, audio_output])
 
@@ -156,7 +175,8 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--vlm-model", default="Qwen/Qwen2-VL-2B-Instruct")
-    parser.add_argument("--audio-model", default="cvssp/audioldm2")
+    parser.add_argument("--audio-model", default="cvssp/audioldm-s-full-v2")
+    parser.add_argument("--comics-dir", default="./comics")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7860)
@@ -165,6 +185,7 @@ def main():
     reader = ComicReader(
         vlm_model=args.vlm_model,
         audio_model=args.audio_model,
+        comics_dir=args.comics_dir,
         device=args.device
     )
     
