@@ -200,7 +200,7 @@ def main():
     parser.add_argument("--comics-dir", default="./comics")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--port", type=int, default=7777)
     args = parser.parse_args()
 
     reader = ComicReader(
