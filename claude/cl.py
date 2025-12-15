@@ -159,6 +159,7 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
                 label="Select Comic",
                 interactive=True
             )
+            load_btn = gr.Button("Load")
             refresh_btn = gr.Button("Refresh")
             page_slider = gr.Slider(0, 0, step=1, label="Page", interactive=True)
         
@@ -176,6 +177,8 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
             if not filename:
                 return None, gr.update(maximum=0, value=0)
             reader.load_comic(filename)
+            if len(reader.pages) == 0:
+                return None, gr.update(maximum=0, value=0)
             max_page = len(reader.pages) - 1
             return np.array(reader.pages[0]), gr.update(maximum=max_page, value=0)
 
@@ -186,6 +189,7 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
             return np.array(reader.pages[reader.current_page_idx])
 
         refresh_btn.click(refresh_list, outputs=[comic_dropdown])
+        load_btn.click(load_comic, inputs=[comic_dropdown], outputs=[comic_image, page_slider])
         comic_dropdown.change(load_comic, inputs=[comic_dropdown], outputs=[comic_image, page_slider])
         page_slider.change(change_page, inputs=[page_slider], outputs=[comic_image])
         comic_image.select(reader.process_click, inputs=[comic_image], outputs=[description_output, audio_output])
