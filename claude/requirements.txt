@@ -12,3 +12,6 @@ qwen-vl-utils>=0.0.2
 PyMuPDF>=1.24.0
 edge-tts>=6.1.0
 soundfile>=0.12.0
+opencv-python>=4.8.0
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
