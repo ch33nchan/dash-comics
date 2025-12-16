@@ -1,7 +1,5 @@
 import argparse
 import io
-import json
-import re
 import gc
 from pathlib import Path
 from typing import Optional
@@ -12,9 +10,9 @@ import numpy as np
 import rarfile
 import torch
 from PIL import Image
-from diffusers import CogVideoXImageToVideoPipeline
+from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
 from diffusers.utils import export_to_video
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, CLIPVisionModel
 from qwen_vl_utils import process_vision_info
 
 
@@ -41,15 +39,27 @@ class ComicAnimator:
         )
         self.vlm_processor = AutoProcessor.from_pretrained(vlm_model)
 
-        print("Loading CogVideoX for animation...")
-        self.video_pipe = CogVideoXImageToVideoPipeline.from_pretrained(
+        print("Loading Wan2.1 I2V pipeline...")
+        
+        image_encoder = CLIPVisionModel.from_pretrained(
+            video_model, 
+            subfolder="image_encoder", 
+            torch_dtype=torch.float32
+        )
+        
+        vae = AutoencoderKLWan.from_pretrained(
+            video_model, 
+            subfolder="vae", 
+            torch_dtype=torch.float32
+        )
+        
+        self.video_pipe = WanImageToVideoPipeline.from_pretrained(
             video_model,
+            vae=vae,
+            image_encoder=image_encoder,
             torch_dtype=torch.bfloat16
         )
         self.video_pipe.to(device)
-        self.video_pipe.enable_sequential_cpu_offload()
-        self.video_pipe.vae.enable_slicing()
-        self.video_pipe.vae.enable_tiling()
 
     def list_comics(self) -> list[str]:
         if not self.comics_dir.exists():
@@ -116,93 +126,92 @@ class ComicAnimator:
         ).to(self.device)
 
         with torch.no_grad():
-            output_ids = self.vlm.generate(**inputs, max_new_tokens=max_tokens, temperature=0.3)
+            output_ids = self.vlm.generate(**inputs, max_new_tokens=max_tokens, temperature=0.2)
 
         generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
         response = self.vlm_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         return response
 
-    def analyze_panel_for_animation(self, panel_image: Image.Image) -> dict:
-        prompt = """You are an animation director for a comic book movie. Analyze this comic panel and describe EXACTLY what motion/animation should happen.
+    def analyze_panel_for_animation(self, panel_image: Image.Image) -> str:
+        prompt = """Analyze this comic book panel and create a detailed motion description for animation.
 
-Look at:
-1. CHARACTERS: What are they doing? What body parts should move?
-2. MECHANICAL PARTS: Any robots, tentacles, weapons - how should they move?
-3. EFFECTS: Speed lines, impact bursts, energy - what motion do they suggest?
-4. EMOTIONS: Character expressions - should they change?
+Describe what should move and how:
+- Character body movements (arms raising, turning, walking)
+- Mechanical parts (tentacles waving, robots moving, weapons swinging)
+- Effects (energy blasts, speed lines becoming animated)
+- Facial expressions changing
+- Camera movement (zoom, pan)
 
-Create a DETAILED motion description for a 3-second animation. Be SPECIFIC about:
-- Starting position → Ending position
-- Direction of movement (left, right, up, down, rotating)
-- Speed (slow, medium, fast)
-- What stays still vs what moves
+Write ONE detailed paragraph describing the animation. Be specific about directions and speeds.
 
-Return a single paragraph prompt that describes ALL the motion in detail. This will be used directly by a video AI model.
+Example: "The villain raises his mechanical tentacle arms in a triumphant pose, the four metallic appendages undulating and coiling like serpents. His human arms pump upward with fists clenched. The tentacle claws open and close menacingly. His expression shifts to a sinister grin. Slight camera push in toward the figure."
 
-Example good prompt: "The muscular man raises both fists triumphantly while his four mechanical tentacle arms wave and undulate menacingly around him. The tentacles move in a serpentine motion, their claw-like ends opening and closing. The man's expression shifts from neutral to a confident smile. Slight camera zoom in on the figure."
+Write the animation description for this panel:"""
 
-Now analyze this panel and write a similar motion prompt:"""
+        response = self._vlm_query(panel_image, prompt, max_tokens=200)
+        print(f"VLM Motion Analysis: {response}")
 
-        response = self._vlm_query(panel_image, prompt, max_tokens=300)
-        print(f"Motion analysis: {response}")
+        motion_prompt = response.strip().replace('"', '').replace('\n', ' ')
+        
+        if len(motion_prompt) < 20:
+            motion_prompt = "Subtle character movement with gentle animation, maintaining comic book art style"
 
-        clean_prompt = response.strip()
-        if len(clean_prompt) < 20:
-            clean_prompt = "Subtle animation with gentle movement, slight camera motion, and atmospheric effects."
+        full_prompt = f"Comic book panel animation, illustrated art style, hand-drawn aesthetic: {motion_prompt}"
+        
+        return full_prompt
 
-        return {"motion_prompt": clean_prompt}
+    def prepare_image_for_wan(self, panel_image: Image.Image) -> Image.Image:
+        target_h = 480
+        target_w = 832
+        
+        img_w, img_h = panel_image.size
+        
+        scale = max(target_w / img_w, target_h / img_h)
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+        
+        resized = panel_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
+        left = (new_w - target_w) // 2
+        top = (new_h - target_h) // 2
+        cropped = resized.crop((left, top, left + target_w, top + target_h))
+        
+        return cropped
 
     def animate_panel(
         self,
         panel_image: Image.Image,
         motion_prompt: str,
-        num_frames: int = 49,
-        fps: int = 8,
-        progress_callback=None
     ) -> str:
-        target_size = (720, 480)
+        prepared_image = self.prepare_image_for_wan(panel_image)
         
-        img_w, img_h = panel_image.size
-        aspect = img_w / img_h
-        target_aspect = target_size[0] / target_size[1]
+        print(f"Prepared image size: {prepared_image.size}")
+        print(f"Motion prompt: {motion_prompt[:100]}...")
 
-        if aspect > target_aspect:
-            new_w = target_size[0]
-            new_h = int(new_w / aspect)
-        else:
-            new_h = target_size[1]
-            new_w = int(new_h * aspect)
-
-        new_w = (new_w // 16) * 16
-        new_h = (new_h // 16) * 16
-        new_w = max(new_w, 256)
-        new_h = max(new_h, 256)
-
-        resized = panel_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-        padded = Image.new("RGB", target_size, (0, 0, 0))
-        paste_x = (target_size[0] - new_w) // 2
-        paste_y = (target_size[1] - new_h) // 2
-        padded.paste(resized, (paste_x, paste_y))
-
-        full_prompt = f"Comic book animation, maintain illustrated art style: {motion_prompt}"
-
-        print(f"Generating video with prompt: {full_prompt[:100]}...")
+        negative_prompt = (
+            "blurry, low quality, distorted, deformed, ugly, bad anatomy, "
+            "realistic photo, 3D render, style change, watermark, text corruption, "
+            "extra limbs, missing limbs, floating objects"
+        )
 
         generator = torch.Generator(device=self.device).manual_seed(42)
 
         with torch.no_grad():
-            video_frames = self.video_pipe(
-                image=padded,
-                prompt=full_prompt,
-                num_frames=num_frames,
+            output = self.video_pipe(
+                image=prepared_image,
+                prompt=motion_prompt,
+                negative_prompt=negative_prompt,
+                height=480,
+                width=832,
+                num_frames=81,
                 num_inference_steps=30,
-                guidance_scale=6.0,
+                guidance_scale=5.0,
                 generator=generator
-            ).frames[0]
+            )
+            video_frames = output.frames[0]
 
-        output_path = self.output_dir / f"comic_animation_{np.random.randint(10000, 99999)}.mp4"
-        export_to_video(video_frames, str(output_path), fps=fps)
+        output_path = self.output_dir / f"comic_anim_{np.random.randint(10000, 99999)}.mp4"
+        export_to_video(video_frames, str(output_path), fps=16)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -215,74 +224,83 @@ Now analyze this panel and write a similar motion prompt:"""
         image: Optional[np.ndarray],
         evt: gr.SelectData,
         progress=gr.Progress()
-    ) -> tuple[str, str, Optional[str]]:
+    ) -> tuple[str, str, Optional[str], Optional[Image.Image]]:
         if image is None or len(self.pages) == 0:
-            return "No image loaded", "", None
+            return "No image loaded", "", None, None
 
         click_x, click_y = evt.index
         pil_image = self.pages[self.current_page_idx]
         img_w, img_h = pil_image.size
 
-        region_size = min(img_w, img_h) // 2
-        x1 = max(0, click_x - region_size // 2)
-        y1 = max(0, click_y - region_size // 2)
-        x2 = min(img_w, x1 + region_size)
-        y2 = min(img_h, y1 + region_size)
+        panel_size = min(img_w, img_h) * 2 // 3
+        
+        x1 = max(0, click_x - panel_size // 2)
+        y1 = max(0, click_y - panel_size // 2)
+        x2 = min(img_w, x1 + panel_size)
+        y2 = min(img_h, y1 + panel_size)
+        
+        if x2 - x1 < panel_size:
+            x1 = max(0, x2 - panel_size)
+        if y2 - y1 < panel_size:
+            y1 = max(0, y2 - panel_size)
 
         panel = pil_image.crop((x1, y1, x2, y2))
 
-        print(f"\n{'='*50}")
-        print(f"Animating panel [{x1},{y1}] to [{x2},{y2}]")
-        print(f"{'='*50}")
+        print(f"\n{'='*60}")
+        print(f"Selected panel: [{x1},{y1}] to [{x2},{y2}]")
+        print(f"Panel size: {panel.size}")
+        print(f"{'='*60}")
 
         progress(0.1, desc="Analyzing panel for motion...")
-        motion_data = self.analyze_panel_for_animation(panel)
-        motion_prompt = motion_data["motion_prompt"]
+        motion_prompt = self.analyze_panel_for_animation(panel)
 
-        progress(0.2, desc="Generating animation (~60-90 seconds)...")
+        progress(0.2, desc="Generating animation with Wan2.1 (60-120s)...")
         video_path = self.animate_panel(panel, motion_prompt)
 
-        description = f"""### Animation Generated
+        description = f"""### Animation Complete
+
+**Selected Region:** [{x1},{y1}] → [{x2},{y2}]
 
 **Motion Prompt:**
 {motion_prompt}
-
-**Output:** {video_path}
 """
         progress(1.0, desc="Done!")
-        return description, motion_prompt, video_path
+        return description, motion_prompt, video_path, panel
 
 
 def build_ui(animator: ComicAnimator) -> gr.Blocks:
-    with gr.Blocks(title="AI Comic Animator", theme=gr.themes.Soft()) as app:
-        gr.Markdown("""# 🎬 AI Comic Animator (CogVideoX)
+    with gr.Blocks(title="AI Comic Animator - Wan2.1", theme=gr.themes.Soft()) as app:
+        gr.Markdown("""# 🎬 AI Comic Animator (Wan2.1)
 
-Load a comic and click on any panel to generate a ~3-5 second animation.
-The AI analyzes the scene and creates motion while preserving the comic art style.""")
+Click on any panel to animate it with AI. The system will:
+1. Extract the clicked panel region
+2. Analyze the scene to determine motion
+3. Generate a ~5 second animation preserving comic art style""")
 
         with gr.Row():
             comic_dropdown = gr.Dropdown(
                 choices=animator.list_comics(),
-                label="Select Comic",
+                label="Comic File",
                 interactive=True
             )
-            load_btn = gr.Button("📖 Load Comic", variant="primary")
-            refresh_btn = gr.Button("🔄 Refresh")
+            load_btn = gr.Button("📖 Load", variant="primary")
+            refresh_btn = gr.Button("🔄")
 
         with gr.Row():
             page_slider = gr.Slider(0, 0, step=1, label="Page", interactive=True)
 
         with gr.Row():
             with gr.Column(scale=1):
-                comic_image = gr.Image(label="📖 Comic Page - Click to animate a panel")
+                comic_image = gr.Image(label="📖 Click to select panel")
             with gr.Column(scale=1):
-                video_output = gr.Video(label="🎬 Generated Animation", autoplay=True)
+                selected_panel = gr.Image(label="Selected Panel", height=250)
+                video_output = gr.Video(label="🎬 Animation", autoplay=True, height=300)
 
         with gr.Row():
-            motion_prompt_display = gr.Textbox(label="Motion Prompt Used", lines=3, interactive=False)
+            motion_prompt_box = gr.Textbox(label="Motion Prompt", lines=3, interactive=False)
 
         with gr.Row():
-            description_output = gr.Markdown("*Click a panel to generate animation*")
+            status_output = gr.Markdown("*Click a panel to animate*")
 
         def refresh_list():
             return gr.update(choices=animator.list_comics())
@@ -308,7 +326,7 @@ The AI analyzes the scene and creates motion while preserving the comic art styl
         comic_image.select(
             animator.process_click,
             inputs=[comic_image],
-            outputs=[description_output, motion_prompt_display, video_output]
+            outputs=[status_output, motion_prompt_box, video_output, selected_panel]
         )
 
     return app
@@ -317,7 +335,7 @@ The AI analyzes the scene and creates motion while preserving the comic art styl
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--vlm-model", default="Qwen/Qwen2-VL-7B-Instruct")
-    parser.add_argument("--video-model", default="THUDM/CogVideoX-5b-I2V")
+    parser.add_argument("--video-model", default="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers")
     parser.add_argument("--comics-dir", default="./comics")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
