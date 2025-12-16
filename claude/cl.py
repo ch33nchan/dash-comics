@@ -147,17 +147,28 @@ If no dialogue, use empty list. If no sound effects visible, use empty list."""}
         if not dialogues:
             return None
 
-        full_text = " ... ".join(dialogues)
-        if len(full_text) > 200:
-            full_text = full_text[:200]
+        full_text = " ".join(dialogues).strip()
+        if len(full_text) < 2:
+            return None
+        if len(full_text) > 150:
+            full_text = full_text[:150]
 
-        inputs = self.tts_tokenizer(full_text, return_tensors="pt").to(self.device)
+        try:
+            inputs = self.tts_tokenizer(full_text, return_tensors="pt")
+            input_ids = inputs["input_ids"].to(self.device)
 
-        with torch.no_grad():
-            audio = self.tts.generate(**inputs, do_sample=True)
+            with torch.no_grad():
+                audio = self.tts.generate(
+                    input_ids,
+                    do_sample=True,
+                    fine_temperature=0.5,
+                    coarse_temperature=0.5
+                )
 
-        audio_np = audio.cpu().numpy().squeeze()
-        return audio_np
+            audio_np = audio.cpu().numpy().squeeze()
+            return audio_np
+        except Exception:
+            return None
 
     def generate_sfx_audio(self, action: str, sound_effects: list[str], emotion: str) -> np.ndarray:
         if sound_effects:
