@@ -1,41 +1,46 @@
 import argparse
+import asyncio
 import io
 import json
 import re
+import tempfile
 from pathlib import Path
 from typing import Optional
 
+import edge_tts
 import fitz
 import gradio as gr
 import numpy as np
 import rarfile
+import soundfile as sf
 import torch
 import torchaudio
 from PIL import Image
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, BarkModel, AutoTokenizer
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 from diffusers import AudioLDMPipeline
 
 
-BARK_VOICES = [
-    "v2/en_speaker_0",
-    "v2/en_speaker_1",
-    "v2/en_speaker_2",
-    "v2/en_speaker_3",
-    "v2/en_speaker_4",
-    "v2/en_speaker_5",
-    "v2/en_speaker_6",
-    "v2/en_speaker_7",
-    "v2/en_speaker_8",
-    "v2/en_speaker_9",
-]
+EDGE_VOICES = {
+    "male_1": "en-US-GuyNeural",
+    "male_2": "en-US-ChristopherNeural",
+    "male_3": "en-GB-RyanNeural",
+    "male_4": "en-AU-WilliamNeural",
+    "female_1": "en-US-JennyNeural",
+    "female_2": "en-US-AriaNeural",
+    "female_3": "en-GB-SoniaNeural",
+    "female_4": "en-AU-NatashaNeural",
+    "narrator": "en-US-DavisNeural",
+    "old_male": "en-US-RogerNeural",
+    "old_female": "en-US-JaneNeural",
+    "child": "en-US-AnaNeural",
+}
 
 
 class ComicReader:
     def __init__(
         self,
         vlm_model: str,
-        tts_model: str,
         sfx_model: str,
         comics_dir: str,
         device: str = "cuda"
@@ -44,7 +49,7 @@ class ComicReader:
         self.comics_dir = Path(comics_dir)
         self.pages: list[Image.Image] = []
         self.current_page_idx: int = 0
-        self.characters: dict[str, str] = {}
+        self.characters: dict[str, dict] = {}
 
         self.vlm = Qwen2VLForConditionalGeneration.from_pretrained(
             vlm_model,
@@ -53,15 +58,12 @@ class ComicReader:
         )
         self.vlm_processor = AutoProcessor.from_pretrained(vlm_model)
 
-        self.tts = BarkModel.from_pretrained(tts_model, torch_dtype=torch.float16).to(device)
-        self.tts_tokenizer = AutoTokenizer.from_pretrained(tts_model)
-        self.tts_sample_rate = 24000
-
         self.sfx_pipe = AudioLDMPipeline.from_pretrained(
             sfx_model,
             torch_dtype=torch.float16
         ).to(device)
         self.sfx_sample_rate = 16000
+        self.tts_sample_rate = 24000
 
     def list_comics(self) -> list[str]:
         if not self.comics_dir.exists():
@@ -78,6 +80,7 @@ class ComicReader:
         self.characters = {}
         filepath = self.comics_dir / filename
 
+        progress(0, desc="Loading pages...")
         if filename.lower().endswith(".cbr"):
             self._load_cbr(filepath)
         elif filename.lower().endswith(".pdf"):
@@ -85,8 +88,8 @@ class ComicReader:
 
         self.current_page_idx = 0
 
-        progress(0, desc="Analyzing characters...")
-        char_report = self._analyze_characters(progress)
+        progress(0.2, desc="Analyzing all characters...")
+        char_report = self._analyze_all_characters(progress)
 
         return self.pages, char_report
 
@@ -111,110 +114,13 @@ class ComicReader:
             self.pages.append(img)
         doc.close()
 
-    def _analyze_characters(self, progress) -> str:
-        if not self.pages:
-            return "No pages loaded"
-
-        all_characters = set()
-        sample_pages = self.pages[:min(5, len(self.pages))]
-
-        for i, page in enumerate(sample_pages):
-            progress((i + 1) / len(sample_pages), desc=f"Scanning page {i + 1}/{len(sample_pages)}...")
-
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": page},
-                        {"type": "text", "text": """List ALL unique character names visible in this comic page.
-Look for:
-- Names in speech bubbles
-- Character labels
-- Names mentioned in dialogue
-- Visual character identification
-
-Respond ONLY with a JSON array of character names:
-["Character1", "Character2", "Character3"]
-
-If no names found, analyze visual appearances and give descriptive names like:
-["Hero in red suit", "Villain with mask", "Old man"]"""}
-                    ]
-                }
-            ]
-
-            text = self.vlm_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, video_inputs = process_vision_info(messages)
-            inputs = self.vlm_processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt"
-            ).to(self.device)
-
-            with torch.no_grad():
-                output_ids = self.vlm.generate(**inputs, max_new_tokens=200, temperature=0.1)
-
-            generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
-            response = self.vlm_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-
-            try:
-                json_match = re.search(r'\[.*\]', response, re.DOTALL)
-                if json_match:
-                    chars = json.loads(json_match.group())
-                    all_characters.update(chars)
-            except json.JSONDecodeError:
-                pass
-
-        char_list = list(all_characters)
-        for i, char in enumerate(char_list):
-            voice_idx = i % len(BARK_VOICES)
-            self.characters[char.lower()] = BARK_VOICES[voice_idx]
-
-        report = "**Detected Characters & Voice Assignments:**\n"
-        for char, voice in self.characters.items():
-            report += f"- {char.title()}: {voice}\n"
-
-        if not self.characters:
-            self.characters["narrator"] = BARK_VOICES[0]
-            self.characters["unknown"] = BARK_VOICES[1]
-            report = "No named characters detected. Using default voices."
-
-        return report
-
-    def _get_voice_for_character(self, speaker: str) -> str:
-        speaker_lower = speaker.lower()
-        if speaker_lower in self.characters:
-            return self.characters[speaker_lower]
-        for char_name, voice in self.characters.items():
-            if char_name in speaker_lower or speaker_lower in char_name:
-                return voice
-        if not self.characters:
-            return BARK_VOICES[0]
-        return list(self.characters.values())[hash(speaker) % len(self.characters)]
-
-    def analyze_panel(self, image: Image.Image, x: int, y: int, w: int, h: int) -> dict:
-        region = image.crop((x, y, x + w, y + h))
-
-        char_list = list(self.characters.keys()) if self.characters else ["unknown speaker"]
-
+    def _vlm_query(self, image: Image.Image, prompt: str, max_tokens: int = 300) -> str:
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": region},
-                    {"type": "text", "text": f"""Analyze this comic panel. Known characters: {char_list}
-
-Extract:
-1. DIALOGUE: Speech with speaker. Format: [{{"speaker": "Name", "text": "dialogue"}}]
-2. ACTION: Physical actions happening
-3. SOUND_EFFECTS: Visible onomatopoeia (BAM, WHOOSH, etc.)
-4. EMOTION: Overall emotional tone
-
-Respond ONLY in this JSON format:
-{{"dialogue": [{{"speaker": "Character1", "text": "What they say"}}], "action": "description", "sound_effects": ["BAM"], "emotion": "angry"}}
-
-Match speakers to known characters when possible."""}
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt}
                 ]
             }
         ]
@@ -230,79 +136,265 @@ Match speakers to known characters when possible."""}
         ).to(self.device)
 
         with torch.no_grad():
-            output_ids = self.vlm.generate(**inputs, max_new_tokens=300, temperature=0.1)
+            output_ids = self.vlm.generate(**inputs, max_new_tokens=max_tokens, temperature=0.1)
 
         generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
         response = self.vlm_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        return response
+
+    def _analyze_all_characters(self, progress) -> str:
+        if not self.pages:
+            return "No pages loaded"
+
+        all_characters = {}
+        total_pages = len(self.pages)
+        
+        self.characters["NARRATOR"] = {
+            "voice": EDGE_VOICES["narrator"],
+            "description": "Story narrator, caption boxes",
+            "gender": "male"
+        }
+
+        for i, page in enumerate(self.pages):
+            progress_val = 0.2 + (0.7 * (i + 1) / total_pages)
+            progress(progress_val, desc=f"Scanning page {i + 1}/{total_pages}...")
+
+            prompt = """Analyze this comic book page carefully. Identify ALL characters present.
+
+For EACH character, provide:
+1. Name (if shown in text/dialogue) OR a descriptive identifier (e.g., "Man in red cape", "Blonde woman")
+2. Gender (male/female/unknown)
+3. Estimated age (child/young/adult/old)
+4. Brief visual description
+
+Also note if there are NARRATION BOXES (rectangular boxes with story text, not speech bubbles).
+
+Respond in this exact JSON format:
+{
+  "characters": [
+    {"name": "Spider-Man", "gender": "male", "age": "young", "description": "Red and blue suit, web pattern"},
+    {"name": "Woman in black dress", "gender": "female", "age": "adult", "description": "Long dark hair, elegant dress"}
+  ],
+  "has_narration": true
+}
+
+Be thorough - identify EVERY visible character, even background ones."""
+
+            response = self._vlm_query(page, prompt, max_tokens=500)
+
+            try:
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    data = json.loads(json_match.group())
+                    for char in data.get("characters", []):
+                        name = char.get("name", "Unknown").strip()
+                        if name and name.lower() not in [c.lower() for c in all_characters.keys()]:
+                            all_characters[name] = {
+                                "gender": char.get("gender", "unknown"),
+                                "age": char.get("age", "adult"),
+                                "description": char.get("description", "")
+                            }
+            except json.JSONDecodeError:
+                continue
+
+        voice_pool = {
+            ("male", "child"): EDGE_VOICES["child"],
+            ("male", "young"): EDGE_VOICES["male_1"],
+            ("male", "adult"): EDGE_VOICES["male_2"],
+            ("male", "old"): EDGE_VOICES["old_male"],
+            ("female", "child"): EDGE_VOICES["child"],
+            ("female", "young"): EDGE_VOICES["female_1"],
+            ("female", "adult"): EDGE_VOICES["female_2"],
+            ("female", "old"): EDGE_VOICES["old_female"],
+        }
+
+        male_voices = [EDGE_VOICES["male_1"], EDGE_VOICES["male_2"], EDGE_VOICES["male_3"], EDGE_VOICES["male_4"]]
+        female_voices = [EDGE_VOICES["female_1"], EDGE_VOICES["female_2"], EDGE_VOICES["female_3"], EDGE_VOICES["female_4"]]
+        male_idx, female_idx = 0, 0
+
+        for name, info in all_characters.items():
+            gender = info.get("gender", "unknown").lower()
+            age = info.get("age", "adult").lower()
+
+            key = (gender, age)
+            if key in voice_pool:
+                voice = voice_pool[key]
+            elif gender == "male":
+                voice = male_voices[male_idx % len(male_voices)]
+                male_idx += 1
+            elif gender == "female":
+                voice = female_voices[female_idx % len(female_voices)]
+                female_idx += 1
+            else:
+                voice = male_voices[male_idx % len(male_voices)]
+                male_idx += 1
+
+            self.characters[name] = {
+                "voice": voice,
+                "description": info.get("description", ""),
+                "gender": gender
+            }
+
+        report = f"**Detected {len(self.characters)} Characters:**\n\n"
+        for name, info in self.characters.items():
+            report += f"- **{name}**: {info['voice']} ({info.get('description', 'N/A')[:50]})\n"
+
+        return report
+
+    def _get_voice_for_speaker(self, speaker: str) -> str:
+        speaker_clean = speaker.strip().upper()
+        
+        if speaker_clean in ["NARRATOR", "NARRATION", "CAPTION", "BOX"]:
+            return EDGE_VOICES["narrator"]
+
+        for char_name, info in self.characters.items():
+            if char_name.upper() == speaker_clean:
+                return info["voice"]
+
+        for char_name, info in self.characters.items():
+            if char_name.upper() in speaker_clean or speaker_clean in char_name.upper():
+                return info["voice"]
+
+        return EDGE_VOICES["male_1"]
+
+    def analyze_panel(self, image: Image.Image, x: int, y: int, w: int, h: int) -> dict:
+        region = image.crop((x, y, x + w, y + h))
+
+        char_names = list(self.characters.keys())
+
+        prompt = f"""Analyze this comic panel in detail.
+
+Known characters in this comic: {char_names}
+
+Extract ALL of the following:
+
+1. NARRATION: Text in rectangular caption boxes (story narration, not dialogue)
+2. DIALOGUE: Speech bubbles - identify WHO is speaking and WHAT they say
+3. THOUGHT: Thought bubbles (usually cloud-shaped)
+4. ACTION: What physical actions are happening
+5. SOUND_EFFECTS: Visible onomatopoeia text (BAM, CRASH, WHOOSH, etc.)
+6. EMOTION: Overall emotional tone of the scene
+
+IMPORTANT: 
+- Match speakers to the known characters list when possible
+- If a caption/narration box exists, mark speaker as "NARRATOR"
+- Include ALL text visible in the panel
+
+Respond ONLY in this exact JSON format:
+{{
+  "narration": "Any narrator caption box text here",
+  "dialogue": [
+    {{"speaker": "Character Name", "text": "What they say"}},
+    {{"speaker": "NARRATOR", "text": "Caption box text"}}
+  ],
+  "thought": [{{"speaker": "Character Name", "text": "What they think"}}],
+  "action": "Description of physical actions",
+  "sound_effects": ["BAM", "CRASH"],
+  "emotion": "tense"
+}}"""
+
+        response = self._vlm_query(region, prompt, max_tokens=500)
 
         try:
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
-                return json.loads(json_match.group())
+                result = json.loads(json_match.group())
+                
+                all_dialogue = []
+                
+                if result.get("narration"):
+                    all_dialogue.append({"speaker": "NARRATOR", "text": result["narration"]})
+                
+                for d in result.get("dialogue", []):
+                    if isinstance(d, dict) and d.get("text"):
+                        all_dialogue.append(d)
+                
+                for t in result.get("thought", []):
+                    if isinstance(t, dict) and t.get("text"):
+                        t["text"] = f"thinking... {t['text']}"
+                        all_dialogue.append(t)
+                
+                result["all_speech"] = all_dialogue
+                return result
         except json.JSONDecodeError:
             pass
 
         return {
+            "narration": "",
             "dialogue": [],
-            "action": response[:100],
+            "thought": [],
+            "action": response[:100] if response else "Unable to analyze",
             "sound_effects": [],
-            "emotion": "neutral"
+            "emotion": "neutral",
+            "all_speech": []
         }
 
-    def generate_dialogue_audio(self, dialogue_entries: list[dict]) -> Optional[np.ndarray]:
-        if not dialogue_entries:
+    async def _generate_speech_async(self, text: str, voice: str) -> Optional[np.ndarray]:
+        if not text or len(text.strip()) < 2:
             return None
 
-        audio_segments = []
-
-        for entry in dialogue_entries:
-            if isinstance(entry, dict):
-                speaker = entry.get("speaker", "unknown")
-                text = entry.get("text", "")
-            else:
-                speaker = "unknown"
-                text = str(entry)
-
-            if not text or len(text.strip()) < 2:
-                continue
-
-            text = text.strip()[:150]
-            voice_preset = self._get_voice_for_character(speaker)
-
-            try:
-                inputs = self.tts_tokenizer(text, return_tensors="pt", voice_preset=voice_preset)
-                input_ids = inputs["input_ids"].to(self.device)
-
-                with torch.no_grad():
-                    audio = self.tts.generate(
-                        input_ids,
-                        do_sample=True,
-                        fine_temperature=0.4,
-                        coarse_temperature=0.4
+        try:
+            communicate = edge_tts.Communicate(text, voice)
+            
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=True) as tmp:
+                await communicate.save(tmp.name)
+                audio, sr = sf.read(tmp.name)
+                
+                if sr != self.tts_sample_rate:
+                    audio_tensor = torch.from_numpy(audio).float()
+                    if audio_tensor.dim() == 1:
+                        audio_tensor = audio_tensor.unsqueeze(0)
+                    else:
+                        audio_tensor = audio_tensor.T
+                    audio_resampled = torchaudio.functional.resample(
+                        audio_tensor, orig_freq=sr, new_freq=self.tts_sample_rate
                     )
-
-                audio_np = audio.cpu().numpy().squeeze()
-                audio_segments.append(audio_np)
-
-                silence = np.zeros(int(self.tts_sample_rate * 0.2))
-                audio_segments.append(silence)
-
-            except Exception:
-                continue
-
-        if not audio_segments:
+                    audio = audio_resampled.squeeze().numpy()
+                
+                return audio
+        except Exception as e:
+            print(f"TTS Error: {e}")
             return None
 
-        return np.concatenate(audio_segments)
+    def generate_dialogue_audio(self, speech_entries: list[dict]) -> Optional[np.ndarray]:
+        if not speech_entries:
+            return None
 
-    def generate_sfx_audio(self, action: str, sound_effects: list[str], emotion: str) -> np.ndarray:
+        async def generate_all():
+            audio_segments = []
+            
+            for entry in speech_entries:
+                speaker = entry.get("speaker", "Unknown")
+                text = entry.get("text", "")
+                
+                if not text or len(text.strip()) < 2:
+                    continue
+
+                voice = self._get_voice_for_speaker(speaker)
+                print(f"Generating speech: [{speaker}] -> {voice}: {text[:50]}...")
+                
+                audio = await self._generate_speech_async(text, voice)
+                
+                if audio is not None and len(audio) > 0:
+                    audio_segments.append(audio)
+                    silence = np.zeros(int(self.tts_sample_rate * 0.3))
+                    audio_segments.append(silence)
+
+            if audio_segments:
+                return np.concatenate(audio_segments)
+            return None
+
+        return asyncio.run(generate_all())
+
+    def generate_sfx_audio(self, action: str, sound_effects: list[str], emotion: str) -> Optional[np.ndarray]:
+        if not sound_effects and not action:
+            return None
+
         if sound_effects:
             sfx_text = ", ".join(sound_effects)
-            prompt = f"comic book sound effect {sfx_text}, {action}, {emotion} mood"
-        elif action:
-            prompt = f"comic book sound effect for {action}, {emotion} mood"
+            prompt = f"comic book sound effect {sfx_text}, {action}, {emotion} mood, dramatic"
         else:
-            prompt = f"ambient background sound, {emotion} mood"
+            prompt = f"comic book action sound for {action}, {emotion} mood"
 
         generator = torch.Generator(device=self.device).manual_seed(np.random.randint(0, 2**32))
 
@@ -310,27 +402,35 @@ Match speakers to known characters when possible."""}
             audio = self.sfx_pipe(
                 prompt,
                 num_inference_steps=20,
-                audio_length_in_s=2.0,
+                audio_length_in_s=1.5,
                 generator=generator
             ).audios[0]
 
         return audio
 
-    def mix_audio(self, dialogue_audio: Optional[np.ndarray], sfx_audio: np.ndarray) -> tuple[int, np.ndarray]:
+    def mix_audio(self, dialogue_audio: Optional[np.ndarray], sfx_audio: Optional[np.ndarray]) -> tuple[int, np.ndarray]:
         output_sr = self.tts_sample_rate
-
-        sfx_resampled = torchaudio.functional.resample(
-            torch.from_numpy(sfx_audio).unsqueeze(0),
-            orig_freq=self.sfx_sample_rate,
-            new_freq=output_sr
-        ).squeeze().numpy()
+        segments = []
 
         if dialogue_audio is not None and len(dialogue_audio) > 0:
-            silence = np.zeros(int(output_sr * 0.3))
-            combined = np.concatenate([dialogue_audio, silence, sfx_resampled])
-        else:
-            combined = sfx_resampled
+            segments.append(dialogue_audio)
 
+        if sfx_audio is not None and len(sfx_audio) > 0:
+            sfx_resampled = torchaudio.functional.resample(
+                torch.from_numpy(sfx_audio).unsqueeze(0),
+                orig_freq=self.sfx_sample_rate,
+                new_freq=output_sr
+            ).squeeze().numpy()
+            
+            if segments:
+                silence = np.zeros(int(output_sr * 0.2))
+                segments.append(silence)
+            segments.append(sfx_resampled)
+
+        if not segments:
+            return output_sr, np.zeros(output_sr, dtype=np.int16)
+
+        combined = np.concatenate(segments)
         combined = combined / (np.abs(combined).max() + 1e-8)
         audio_int16 = (combined * 32767).astype(np.int16)
 
@@ -351,9 +451,15 @@ Match speakers to known characters when possible."""}
         x2 = min(img_w, x1 + region_size)
         y2 = min(img_h, y1 + region_size)
 
+        print(f"\n=== Analyzing region [{x1},{y1}] to [{x2},{y2}] ===")
         panel_data = self.analyze_panel(pil_image, x1, y1, x2 - x1, y2 - y1)
+        print(f"Panel data: {json.dumps(panel_data, indent=2)}")
 
-        dialogue_audio = self.generate_dialogue_audio(panel_data.get("dialogue", []))
+        all_speech = panel_data.get("all_speech", [])
+        print(f"Speech entries to generate: {len(all_speech)}")
+        
+        dialogue_audio = self.generate_dialogue_audio(all_speech)
+        
         sfx_audio = self.generate_sfx_audio(
             panel_data.get("action", ""),
             panel_data.get("sound_effects", []),
@@ -362,26 +468,41 @@ Match speakers to known characters when possible."""}
 
         sample_rate, combined_audio = self.mix_audio(dialogue_audio, sfx_audio)
 
+        narration = panel_data.get("narration", "")
         dialogue_str = ""
         for d in panel_data.get("dialogue", []):
             if isinstance(d, dict):
-                dialogue_str += f"{d.get('speaker', '?')}: \"{d.get('text', '')}\"\n"
-            else:
-                dialogue_str += f"?: \"{d}\"\n"
+                dialogue_str += f"**{d.get('speaker', '?')}**: \"{d.get('text', '')}\"\n"
+        
+        thought_str = ""
+        for t in panel_data.get("thought", []):
+            if isinstance(t, dict):
+                thought_str += f"**{t.get('speaker', '?')}** (thinking): \"{t.get('text', '')}\"\n"
 
-        description = (
-            f"**Dialogue:**\n{dialogue_str if dialogue_str else 'None'}\n\n"
-            f"**Action:** {panel_data.get('action', 'N/A')}\n"
-            f"**SFX:** {panel_data.get('sound_effects', [])}\n"
-            f"**Emotion:** {panel_data.get('emotion', 'N/A')}"
-        )
+        description = f"""### Panel Analysis
+
+**Narration:** {narration if narration else 'None'}
+
+**Dialogue:**
+{dialogue_str if dialogue_str else 'None'}
+
+**Thoughts:**
+{thought_str if thought_str else 'None'}
+
+**Action:** {panel_data.get('action', 'N/A')}
+
+**Sound Effects:** {', '.join(panel_data.get('sound_effects', [])) or 'None'}
+
+**Emotion:** {panel_data.get('emotion', 'N/A')}"""
 
         return description, (sample_rate, combined_audio)
 
 
 def build_ui(reader: ComicReader) -> gr.Blocks:
-    with gr.Blocks(title="AI Comic Reader") as app:
-        gr.Markdown("# AI Comic Reader\nLoad a comic to detect characters and assign voices. Click panels to hear dialogue and sound effects.")
+    with gr.Blocks(title="AI Comic Reader", theme=gr.themes.Soft()) as app:
+        gr.Markdown("""# AI Comic Reader
+        
+Load a comic to detect ALL characters and assign unique voices. Click on any panel to hear dialogue, narration, and sound effects.""")
 
         with gr.Row():
             comic_dropdown = gr.Dropdown(
@@ -389,24 +510,24 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
                 label="Select Comic",
                 interactive=True
             )
-            load_btn = gr.Button("Load & Analyze", variant="primary")
-            refresh_btn = gr.Button("Refresh")
-            reset_btn = gr.Button("Reset")
+            load_btn = gr.Button("Load & Analyze All Characters", variant="primary")
+            refresh_btn = gr.Button("Refresh List")
+            reset_btn = gr.Button("Reset", variant="stop")
 
         with gr.Row():
-            character_report = gr.Markdown("*Load a comic to detect characters*")
+            character_report = gr.Markdown("*Load a comic to detect characters and assign voices*")
 
         with gr.Row():
             page_slider = gr.Slider(0, 0, step=1, label="Page", interactive=True)
 
         with gr.Row():
-            comic_image = gr.Image(label="Comic Page (Click on a panel)")
+            comic_image = gr.Image(label="Comic Page - Click anywhere to analyze that region")
 
         with gr.Row():
-            description_output = gr.Markdown("*Click a panel to analyze*")
-
-        with gr.Row():
-            audio_output = gr.Audio(label="Generated Audio", autoplay=True)
+            with gr.Column():
+                description_output = gr.Markdown("*Click a panel to analyze and hear*")
+            with gr.Column():
+                audio_output = gr.Audio(label="Generated Audio", autoplay=True)
 
         def refresh_list():
             return gr.update(choices=reader.list_comics())
@@ -414,16 +535,17 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
         def load_comic(filename, progress=gr.Progress()):
             if not filename:
                 return None, gr.update(maximum=0, value=0), "*No comic selected*"
+            
             reader.load_comic(filename, progress)
+            
             if len(reader.pages) == 0:
                 return None, gr.update(maximum=0, value=0), "*Failed to load comic*"
+            
             max_page = len(reader.pages) - 1
 
-            char_report = "**Detected Characters & Voices:**\n"
-            for char, voice in reader.characters.items():
-                char_report += f"- {char.title()}: `{voice}`\n"
-            if not reader.characters:
-                char_report = "*No characters detected*"
+            char_report = f"**Detected {len(reader.characters)} Characters:**\n\n"
+            for name, info in reader.characters.items():
+                char_report += f"- **{name}**: `{info['voice']}`\n"
 
             return np.array(reader.pages[0]), gr.update(maximum=max_page, value=0), char_report
 
@@ -443,7 +565,7 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
                 "*Click a panel to analyze*",
                 None,
                 gr.update(value=None),
-                "*Load a comic to detect characters*"
+                "*Load a comic to detect characters and assign voices*"
             )
 
         refresh_btn.click(refresh_list, outputs=[comic_dropdown])
@@ -469,7 +591,6 @@ def build_ui(reader: ComicReader) -> gr.Blocks:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--vlm-model", default="Qwen/Qwen2-VL-2B-Instruct")
-    parser.add_argument("--tts-model", default="suno/bark-small")
     parser.add_argument("--sfx-model", default="cvssp/audioldm-s-full-v2")
     parser.add_argument("--comics-dir", default="./comics")
     parser.add_argument("--device", default="cuda")
@@ -479,7 +600,6 @@ def main():
 
     reader = ComicReader(
         vlm_model=args.vlm_model,
-        tts_model=args.tts_model,
         sfx_model=args.sfx_model,
         comics_dir=args.comics_dir,
         device=args.device
