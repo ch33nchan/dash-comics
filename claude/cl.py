@@ -2,7 +2,7 @@ import argparse
 import io
 import json
 import re
-import tempfile
+import gc
 from pathlib import Path
 from typing import Optional
 
@@ -12,7 +12,7 @@ import numpy as np
 import rarfile
 import torch
 from PIL import Image
-from diffusers import StableVideoDiffusionPipeline
+from diffusers import CogVideoXImageToVideoPipeline
 from diffusers.utils import export_to_video
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
@@ -33,22 +33,23 @@ class ComicAnimator:
         self.output_dir = Path("./outputs")
         self.output_dir.mkdir(exist_ok=True)
 
-        print("Loading VLM...")
+        print("Loading VLM for motion analysis...")
         self.vlm = Qwen2VLForConditionalGeneration.from_pretrained(
             vlm_model,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             device_map="auto"
         )
         self.vlm_processor = AutoProcessor.from_pretrained(vlm_model)
 
-        print("Loading Stable Video Diffusion...")
-        self.video_pipe = StableVideoDiffusionPipeline.from_pretrained(
+        print("Loading CogVideoX for animation...")
+        self.video_pipe = CogVideoXImageToVideoPipeline.from_pretrained(
             video_model,
-            torch_dtype=torch.float16,
-            variant="fp16"
+            torch_dtype=torch.bfloat16
         )
         self.video_pipe.to(device)
-        self.video_pipe.enable_model_cpu_offload()
+        self.video_pipe.enable_sequential_cpu_offload()
+        self.video_pipe.vae.enable_slicing()
+        self.video_pipe.vae.enable_tiling()
 
     def list_comics(self) -> list[str]:
         if not self.comics_dir.exists():
@@ -93,13 +94,16 @@ class ComicAnimator:
             self.pages.append(img)
         doc.close()
 
-    def _vlm_query(self, images: list[Image.Image], prompt: str, max_tokens: int = 500) -> str:
-        content = []
-        for img in images:
-            content.append({"type": "image", "image": img})
-        content.append({"type": "text", "text": prompt})
-
-        messages = [{"role": "user", "content": content}]
+    def _vlm_query(self, image: Image.Image, prompt: str, max_tokens: int = 400) -> str:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
 
         text = self.vlm_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
@@ -118,164 +122,92 @@ class ComicAnimator:
         response = self.vlm_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         return response
 
-    def _get_context_panels(self, page_img: Image.Image, x: int, y: int, w: int, h: int) -> dict:
-        current_panel = page_img.crop((x, y, x + w, y + h))
-        
-        img_w, img_h = page_img.size
-        
-        prev_panel = None
-        next_panel = None
-        
-        if y > h:
-            prev_y = max(0, y - h - 20)
-            prev_panel = page_img.crop((x, prev_y, x + w, prev_y + h))
-        elif x > w:
-            prev_x = max(0, x - w - 20)
-            prev_panel = page_img.crop((prev_x, y, prev_x + w, y + h))
-        
-        if y + h * 2 < img_h:
-            next_y = min(img_h - h, y + h + 20)
-            next_panel = page_img.crop((x, next_y, x + w, next_y + h))
-        elif x + w * 2 < img_w:
-            next_x = min(img_w - w, x + w + 20)
-            next_panel = page_img.crop((next_x, y, next_x + w, y + h))
+    def analyze_panel_for_animation(self, panel_image: Image.Image) -> dict:
+        prompt = """You are an animation director for a comic book movie. Analyze this comic panel and describe EXACTLY what motion/animation should happen.
 
-        return {
-            "current": current_panel,
-            "previous": prev_panel,
-            "next": next_panel
-        }
+Look at:
+1. CHARACTERS: What are they doing? What body parts should move?
+2. MECHANICAL PARTS: Any robots, tentacles, weapons - how should they move?
+3. EFFECTS: Speed lines, impact bursts, energy - what motion do they suggest?
+4. EMOTIONS: Character expressions - should they change?
 
-    def analyze_for_animation(self, panels: dict) -> dict:
-        images = [panels["current"]]
-        context_desc = ""
-        
-        if panels["previous"]:
-            images.insert(0, panels["previous"])
-            context_desc += "First image: PREVIOUS panel. "
-        if panels["next"]:
-            images.append(panels["next"])
-            context_desc += "Last image: NEXT panel. "
-        
-        if len(images) == 1:
-            context_desc = "Single panel to animate."
+Create a DETAILED motion description for a 3-second animation. Be SPECIFIC about:
+- Starting position → Ending position
+- Direction of movement (left, right, up, down, rotating)
+- Speed (slow, medium, fast)
+- What stays still vs what moves
 
-        prompt = f"""You are an animation director. Analyze these comic panel(s) to plan a 3-second animation.
+Return a single paragraph prompt that describes ALL the motion in detail. This will be used directly by a video AI model.
 
-{context_desc}
-The MIDDLE/MAIN image is the panel to animate.
+Example good prompt: "The muscular man raises both fists triumphantly while his four mechanical tentacle arms wave and undulate menacingly around him. The tentacles move in a serpentine motion, their claw-like ends opening and closing. The man's expression shifts from neutral to a confident smile. Slight camera zoom in on the figure."
 
-Describe EXACTLY what motion should happen in a 3-second animation:
+Now analyze this panel and write a similar motion prompt:"""
 
-1. CHARACTERS: List each character/figure visible and their motion
-   - Starting pose → Ending pose
-   - Body movement (walking, jumping, punching, turning)
-   - Facial expression changes
-   - Hand/arm gestures
+        response = self._vlm_query(panel_image, prompt, max_tokens=300)
+        print(f"Motion analysis: {response}")
 
-2. OBJECTS: Any objects that should move
-   - Projectiles, weapons, vehicles
-   - Environmental elements (doors, papers, debris)
+        clean_prompt = response.strip()
+        if len(clean_prompt) < 20:
+            clean_prompt = "Subtle animation with gentle movement, slight camera motion, and atmospheric effects."
 
-3. EFFECTS: Visual effects to animate
-   - Speed lines, impact bursts
-   - Explosions, smoke, fire
-   - Text/onomatopoeia (should pulse or shake)
-
-4. CAMERA: Suggested camera motion
-   - Zoom in/out
-   - Pan left/right/up/down
-   - Shake for impact
-
-5. MOTION_INTENSITY: Rate 1-10 how much motion (1=subtle, 10=intense action)
-
-Based on story context (what happened before, what happens after), the animation should feel continuous.
-
-Return ONLY this JSON:
-{{
-  "scene_description": "Brief description of what's happening",
-  "characters": [
-    {{"name": "Hero", "motion": "Throws punch from left to right, body rotating forward"}}
-  ],
-  "objects": [
-    {{"name": "Debris", "motion": "Fragments fly outward from impact point"}}
-  ],
-  "effects": [
-    {{"type": "impact_burst", "motion": "Expands rapidly then fades"}}
-  ],
-  "camera": "Slight zoom in with shake on impact",
-  "motion_intensity": 7,
-  "motion_prompt": "A single clear sentence describing the main motion for the video model"
-}}"""
-
-        response = self._vlm_query(images, prompt, max_tokens=600)
-        print(f"Animation analysis: {response}")
-
-        try:
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-        except json.JSONDecodeError:
-            pass
-
-        return {
-            "scene_description": "Comic panel with action",
-            "characters": [],
-            "objects": [],
-            "effects": [],
-            "camera": "slight zoom",
-            "motion_intensity": 5,
-            "motion_prompt": "Subtle movement and camera pan across the scene"
-        }
+        return {"motion_prompt": clean_prompt}
 
     def animate_panel(
         self,
         panel_image: Image.Image,
-        motion_data: dict,
-        num_frames: int = 25,
-        fps: int = 8
+        motion_prompt: str,
+        num_frames: int = 49,
+        fps: int = 8,
+        progress_callback=None
     ) -> str:
-        target_size = (1024, 576)
+        target_size = (720, 480)
         
         img_w, img_h = panel_image.size
         aspect = img_w / img_h
         target_aspect = target_size[0] / target_size[1]
-        
+
         if aspect > target_aspect:
             new_w = target_size[0]
             new_h = int(new_w / aspect)
         else:
             new_h = target_size[1]
             new_w = int(new_h * aspect)
-        
+
+        new_w = (new_w // 16) * 16
+        new_h = (new_h // 16) * 16
+        new_w = max(new_w, 256)
+        new_h = max(new_h, 256)
+
         resized = panel_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        
+
         padded = Image.new("RGB", target_size, (0, 0, 0))
         paste_x = (target_size[0] - new_w) // 2
         paste_y = (target_size[1] - new_h) // 2
         padded.paste(resized, (paste_x, paste_y))
 
-        motion_intensity = motion_data.get("motion_intensity", 5)
-        motion_bucket_id = min(255, max(1, motion_intensity * 25))
+        full_prompt = f"Comic book animation, maintain illustrated art style: {motion_prompt}"
 
-        print(f"Generating video with motion_bucket_id={motion_bucket_id}...")
+        print(f"Generating video with prompt: {full_prompt[:100]}...")
 
-        generator = torch.Generator(device=self.device).manual_seed(np.random.randint(0, 2**32))
+        generator = torch.Generator(device=self.device).manual_seed(42)
 
         with torch.no_grad():
-            frames = self.video_pipe(
-                padded,
+            video_frames = self.video_pipe(
+                image=padded,
+                prompt=full_prompt,
                 num_frames=num_frames,
-                decode_chunk_size=8,
-                motion_bucket_id=motion_bucket_id,
-                noise_aug_strength=0.1,
+                num_inference_steps=30,
+                guidance_scale=6.0,
                 generator=generator
             ).frames[0]
 
-        output_path = self.output_dir / f"animation_{np.random.randint(10000, 99999)}.mp4"
-        export_to_video(frames, str(output_path), fps=fps)
+        output_path = self.output_dir / f"comic_animation_{np.random.randint(10000, 99999)}.mp4"
+        export_to_video(video_frames, str(output_path), fps=fps)
 
-        print(f"Video saved to {output_path}")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print(f"Video saved: {output_path}")
         return str(output_path)
 
     def process_click(
@@ -283,68 +215,50 @@ Return ONLY this JSON:
         image: Optional[np.ndarray],
         evt: gr.SelectData,
         progress=gr.Progress()
-    ) -> tuple[str, Optional[str]]:
+    ) -> tuple[str, str, Optional[str]]:
         if image is None or len(self.pages) == 0:
-            return "No image loaded", None
+            return "No image loaded", "", None
 
         click_x, click_y = evt.index
         pil_image = self.pages[self.current_page_idx]
         img_w, img_h = pil_image.size
 
-        region_size = min(img_w, img_h) // 3
+        region_size = min(img_w, img_h) // 2
         x1 = max(0, click_x - region_size // 2)
         y1 = max(0, click_y - region_size // 2)
         x2 = min(img_w, x1 + region_size)
         y2 = min(img_h, y1 + region_size)
 
+        panel = pil_image.crop((x1, y1, x2, y2))
+
         print(f"\n{'='*50}")
-        print(f"Animating panel at [{x1},{y1}] to [{x2},{y2}]")
+        print(f"Animating panel [{x1},{y1}] to [{x2},{y2}]")
         print(f"{'='*50}")
 
-        progress(0.1, desc="Getting context panels...")
-        panels = self._get_context_panels(pil_image, x1, y1, x2 - x1, y2 - y1)
+        progress(0.1, desc="Analyzing panel for motion...")
+        motion_data = self.analyze_panel_for_animation(panel)
+        motion_prompt = motion_data["motion_prompt"]
 
-        progress(0.2, desc="Analyzing scene for animation...")
-        motion_data = self.analyze_for_animation(panels)
+        progress(0.2, desc="Generating animation (~60-90 seconds)...")
+        video_path = self.animate_panel(panel, motion_prompt)
 
-        progress(0.4, desc="Generating animation (this takes ~30-60s)...")
-        video_path = self.animate_panel(panels["current"], motion_data)
+        description = f"""### Animation Generated
 
-        description = f"""### Animation Plan
+**Motion Prompt:**
+{motion_prompt}
 
-**Scene:** {motion_data.get('scene_description', 'N/A')}
-
-**Characters:**
+**Output:** {video_path}
 """
-        for char in motion_data.get('characters', []):
-            description += f"- **{char.get('name', '?')}**: {char.get('motion', 'N/A')}\n"
-
-        description += "\n**Objects:**\n"
-        for obj in motion_data.get('objects', []):
-            description += f"- **{obj.get('name', '?')}**: {obj.get('motion', 'N/A')}\n"
-
-        description += "\n**Effects:**\n"
-        for fx in motion_data.get('effects', []):
-            description += f"- **{fx.get('type', '?')}**: {fx.get('motion', 'N/A')}\n"
-
-        description += f"""
-**Camera:** {motion_data.get('camera', 'N/A')}
-
-**Motion Intensity:** {motion_data.get('motion_intensity', 'N/A')}/10
-
-**Motion Prompt:** {motion_data.get('motion_prompt', 'N/A')}
-"""
-
         progress(1.0, desc="Done!")
-        return description, video_path
+        return description, motion_prompt, video_path
 
 
 def build_ui(animator: ComicAnimator) -> gr.Blocks:
     with gr.Blocks(title="AI Comic Animator", theme=gr.themes.Soft()) as app:
-        gr.Markdown("""# 🎬 AI Comic Animator
+        gr.Markdown("""# 🎬 AI Comic Animator (CogVideoX)
 
-Load a comic, click on any panel to bring it to life with AI-generated animation.
-The animation considers context from surrounding panels for continuity.""")
+Load a comic and click on any panel to generate a ~3-5 second animation.
+The AI analyzes the scene and creates motion while preserving the comic art style.""")
 
         with gr.Row():
             comic_dropdown = gr.Dropdown(
@@ -360,9 +274,12 @@ The animation considers context from surrounding panels for continuity.""")
 
         with gr.Row():
             with gr.Column(scale=1):
-                comic_image = gr.Image(label="📖 Comic Page - Click a panel to animate")
+                comic_image = gr.Image(label="📖 Comic Page - Click to animate a panel")
             with gr.Column(scale=1):
-                video_output = gr.Video(label="🎬 Animation", autoplay=True)
+                video_output = gr.Video(label="🎬 Generated Animation", autoplay=True)
+
+        with gr.Row():
+            motion_prompt_display = gr.Textbox(label="Motion Prompt Used", lines=3, interactive=False)
 
         with gr.Row():
             description_output = gr.Markdown("*Click a panel to generate animation*")
@@ -391,7 +308,7 @@ The animation considers context from surrounding panels for continuity.""")
         comic_image.select(
             animator.process_click,
             inputs=[comic_image],
-            outputs=[description_output, video_output]
+            outputs=[description_output, motion_prompt_display, video_output]
         )
 
     return app
@@ -399,8 +316,8 @@ The animation considers context from surrounding panels for continuity.""")
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--vlm-model", default="Qwen/Qwen2-VL-2B-Instruct")
-    parser.add_argument("--video-model", default="stabilityai/stable-video-diffusion-img2vid-xt")
+    parser.add_argument("--vlm-model", default="Qwen/Qwen2-VL-7B-Instruct")
+    parser.add_argument("--video-model", default="THUDM/CogVideoX-5b-I2V")
     parser.add_argument("--comics-dir", default="./comics")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
